@@ -252,18 +252,26 @@ class ACPCallingAgent(MultiStepAgent):
                 Available agents:
                 {agents}
 
+                CRITICAL LANGUAGE REQUIREMENT: You MUST respond ONLY in English. Never use any other language.
+                
                 Your task is to:
                 1. Analyze the user's request
                 2. Call the appropriate agent(s) to gather information
-                3. When you have a complete answer, ALWAYS call the final_answer tool with your response
-                4. Do not provide answers directly in your messages - always use the final_answer tool
-                5. If you have sufficient information to complete a task do not call out to another agent unless required
+                3. When you have sufficient information to answer the user's question, provide a complete summary
+                4. You can either call the final_answer tool OR provide a complete answer directly in your response
+                5. If you have gathered information from agents, synthesize it into a clear, complete answer
+
+                Guidelines for providing answers:
+                - If you have all the information needed, provide a complete answer immediately
+                - Start answers with phrases like "Based on the information gathered:" or "According to..."
+                - Include all relevant details from the agent responses
+                - Don't ask follow-up questions unless the original query is genuinely incomplete
 
                 Remember:
-                - Always use the final_answer tool when you have a complete answer
-                - Do not provide answers in your regular messages
-                - Chain multiple agent calls if needed to gather all required information
-                - The final_answer tool is the only way to return results to the user
+                - RESPOND EXCLUSIVELY IN ENGLISH - NO EXCEPTIONS
+                - Provide complete, helpful answers when you have sufficient information
+                - Chain multiple agent calls only if you need additional information
+                - Use only English language characters and words
                 """
             }
         
@@ -351,15 +359,51 @@ class ACPCallingAgent(MultiStepAgent):
         
         try:
             import logging
-            import sys 
+            import sys
             logging.warn(list(self.tools.values())[:-1])
-            # sys.exit()
+
             # Get response from the model
             model_message: ChatMessage = self.model(
                 memory_messages,
                 tools_to_call_from=list(self.tools.values())[:-1],
                 stop_sequences=["Observation:", "Calling agents:"],
             )
+
+            # Helper to clean model outputs: strip any
+            # non-English prefix while preserving JSON-like tool call blocks.
+            def _clean_text(text: Optional[str]) -> str:
+                if not text:
+                    return ""
+                import re
+
+                # If there's a JSON-like object (tool call) in the text, extract it
+                json_obj_match = re.search(r"(\{[\s\S]*\})", text)
+                if json_obj_match:
+                    candidate = json_obj_match.group(1)
+                    # return the JSON object trimmed
+                    return candidate.strip()
+
+                # scripts that are unlikely to be English letters (keep basic punctuation)
+                cleaned = re.sub(r"[\u0E00-\u0E7F]", "", text)
+                # Also remove other CJK/extended ranges commonly not used in English
+                cleaned = re.sub(r"[\u4E00-\u9FFF\u3040-\u30FF]", "", cleaned)
+
+                # Collapse whitespace
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+                # If cleaned is empty or extremely short compared to original, give a safe English fallback
+                if len(cleaned) < max(10, len(text) * 0.2):
+                    return "I understand the request and will respond in English only."
+
+                return cleaned
+
+            # Ensure both content and raw are cleaned so logs and downstream logic use English text
+            cleaned_content = _clean_text(getattr(model_message, 'content', None))
+            if not cleaned_content and hasattr(model_message, 'raw') and model_message.raw is not None:
+                cleaned_content = _clean_text(str(model_message.raw))
+
+            # Set the cleaned content back on the model_message so later logic and logging use it
+            model_message.content = cleaned_content
 
             memory_step.model_output_message = model_message
         except Exception as e:
@@ -373,14 +417,42 @@ class ACPCallingAgent(MultiStepAgent):
         
         # Check if the model called any tools/agents
         if not hasattr(model_message, 'tool_calls') or model_message.tool_calls is None or len(model_message.tool_calls) == 0:
-            # If no tool calls, treat content as final answer
-            if model_message.content and "final_answer" in model_message.content.lower():
+            # If no tool calls, check if content looks like a complete answer
+            content = model_message.content or ""
+            
+            # Auto-detect final answers based on content patterns
+            is_final_answer = False
+            
+            # Check for explicit final answer indicators
+            if "final_answer" in content.lower():
+                is_final_answer = True
+            # Check if content looks like a complete summary/conclusion
+            elif (any(indicator in content.lower() for indicator in [
+                "based on the information gathered",
+                "according to",
+                "the waiting period",
+                "in summary",
+                "to summarize",
+                "the answer is",
+                "here's what",
+                "here is what"
+            ]) and len(content.strip()) > 50):
+                is_final_answer = True
+            # Check if we have gathered information and this looks like a synthesis
+            elif (len(self.state) > 0 and 
+                  len(content.strip()) > 30 and 
+                  not any(question in content.lower() for question in [
+                      "would you like", "do you want", "should i", "shall i", "more details"
+                  ])):
+                is_final_answer = True
+            
+            if is_final_answer:
                 self.logger.log(
-                    f"Final answer detected in content: {model_message.content}",
+                    f"Final answer auto-detected in content: {content}",
                     level=LogLevel.INFO,
                 )
-                memory_step.action_output = model_message.content
-                return model_message.content
+                memory_step.action_output = content
+                return content
             else:
                 # Try to extract a tool call from the content using a simple parser
                 content = model_message.content or ""
@@ -420,7 +492,7 @@ class ACPCallingAgent(MultiStepAgent):
                         self.logger.log(f"Error parsing tool call from content: {e}", level=LogLevel.ERROR)
                 
                 raise AgentParsingError(
-                    "Model did not call any agents and no final answer detected. Content: " + (model_message.content or "None"), 
+                    f"Model did not call any agents and provided incomplete response. Content: {content or 'None'}", 
                     self.logger
                 )
         
@@ -573,7 +645,8 @@ class ACPCallingAgent(MultiStepAgent):
             str: Final answer from the agent
         """
         # Initialize memory with the user query in the correct format for LiteLLM
-        user_message = {"role": "user", "content": [{"type": "text", "text": query}]}
+        enhanced_query = f"Please respond ONLY in English. {query}"
+        user_message = {"role": "user", "content": [{"type": "text", "text": enhanced_query}]}
         system_message = {"role": "system", "content": [{"type": "text", "text": self.initialize_system_prompt()}]}
         self.input_messages = [system_message, user_message]
         
@@ -622,14 +695,23 @@ class ACPCallingAgent(MultiStepAgent):
                     # Add observation as user message
                     self.input_messages.append({
                         "role": "user", 
-                        "content": [{"type": "text", "text": f"Observation: {memory_step.observations}"}]
+                        "content": [{"type": "text", "text": f"Observation: {memory_step.observations}. Please provide a complete answer based on this information."}]
                     })
             except Exception as e:
                 self.logger.log(f"Error in step {step_num + 1}: {str(e)}", level=LogLevel.ERROR)
+                
+                # If we have information in state, try to provide a final answer
+                if self.state and step_num > 3:
+                    summary = "Based on the information gathered:\n"
+                    for key, value in self.state.items():
+                        summary += f"- {key}: {value}\n"
+                    self.logger.log(f"Providing summary from state due to repeated errors: {summary}", level=LogLevel.INFO)
+                    return summary
+                
                 # Add error message to conversation
                 self.input_messages.append({
                     "role": "user",
-                    "content": [{"type": "text", "text": f"Error occurred: {str(e)}. Please try a different approach or provide a final answer."}]
+                    "content": [{"type": "text", "text": f"Error occurred: {str(e)}. Please provide a clear final answer based on any information you have gathered."}]
                 })
         
         # If we hit max steps without a final answer
